@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knn-tewma-ca"
+version = "1.0.0"
+description = "Contention-aware adaptive scheduler for HPC job backfilling: simulator, schedulers and experiments"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Neeraj Yadav" }]
+requires-python = ">=3.9"
+dependencies = ["matplotlib>=3.7"]
+keywords = ["hpc", "scheduling", "backfilling", "runtime prediction", "simulation"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Distributed Computing",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+knn-tewma-ca = "knn_tewma_ca.cli:main"
+
+[project.urls]
+Repository = "https://github.com/neerajydv0908/kNN-TEWMA-CA"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
