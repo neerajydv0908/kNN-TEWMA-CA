@@ -10,6 +10,15 @@
   Queue pressure raises the confidence level, shrinks the backfill window
   and gates out low-trust classes; candidates are ranked to prefer short,
   narrow, high-trust jobs.
+
+``PaddedBaseline`` is a reference point rather than a contender: the baseline
+with every allocation multiplied by a fixed factor. It shows how much success
+plain over-allocation buys.
+
+All schedulers learn only from ``Observation`` objects. Under censored
+learning a killed job's runtime is reconstructed with the same per-class
+``ClassModel`` estimator in every scheduler, so none of them gets an edge from
+how it handles censoring.
 """
 
 from __future__ import annotations
@@ -19,12 +28,16 @@ from typing import Deque, Dict, List, Sequence
 
 from .job import RUNTIME_CLASSES, Job, runtime_class
 from .predictors import ClassModel, QueuePressure
-from .simulator import Launch, ReservationView, Scheduler
+from .simulator import CORRECTED, Launch, Methodology, Observation, Scheduler
 
 #: Backfill candidates whose estimate is below this fraction of the user's
 #: prediction are skipped, so a backfill decision never rests on the model
 #: cutting a job's runtime by more than 15%.
 MIN_ESTIMATE_FRACTION = 0.85
+
+
+def _class_models() -> Dict[str, ClassModel]:
+    return {c: ClassModel() for c in RUNTIME_CLASSES}
 
 
 class EasyBaseline(Scheduler):
@@ -33,11 +46,20 @@ class EasyBaseline(Scheduler):
     name = "Baseline"
     ERROR_WINDOW = 50
 
+    def __init__(self, total_nodes: int = 8, methodology: Methodology = CORRECTED) -> None:
+        super().__init__(total_nodes, methodology)
+
     def reset(self) -> None:
         self.recent_errors: Deque[float] = deque(maxlen=self.ERROR_WINDOW)
+        # Only used to reconstruct killed jobs' runtimes under censored learning.
+        self.models = _class_models()
 
-    def observe(self, job: Job) -> None:
-        err = abs(job.predicted_runtime - job.actual_runtime) / max(job.actual_runtime, 1.0)
+    def observe(self, obs: Observation) -> None:
+        runtime = obs.runtime
+        if self.methodology.censored_learning:
+            model = self.models[runtime_class(obs.predicted_runtime)]
+            runtime = model.observe(obs.predicted_runtime, obs.runtime, obs.censored)
+        err = abs(obs.predicted_runtime - runtime) / max(runtime, 1.0)
         self.recent_errors.append(err)
 
     def head_allocation(self, job: Job) -> float:
@@ -62,28 +84,41 @@ class EasyBaseline(Scheduler):
         return launches
 
 
+class PaddedBaseline(EasyBaseline):
+    """The baseline with every allocation multiplied by a fixed ``factor``."""
+
+    def __init__(self, total_nodes: int = 8, methodology: Methodology = CORRECTED, factor: float = 1.5) -> None:
+        super().__init__(total_nodes, methodology)
+        self.factor = factor
+        self.name = f"Baseline x{factor:g}"
+
+    def head_allocation(self, job: Job) -> float:
+        return job.predicted_runtime * self.factor
+
+    def padding(self) -> float:
+        return self.factor
+
+
 class TewmaScheduler(Scheduler):
     """Per-class TEWMA runtime correction with trust-weighted backfill."""
 
     name = "TEWMA"
 
     def __init__(
-        self,
-        total_nodes: int = 8,
-        confidence: float = 0.80,
-        reservation_view: ReservationView = ReservationView.ALLOCATED_END,
+        self, total_nodes: int = 8, confidence: float = 0.80, methodology: Methodology = CORRECTED
     ) -> None:
-        super().__init__(total_nodes, reservation_view)
+        super().__init__(total_nodes, methodology)
         self.confidence = confidence
 
     def reset(self) -> None:
-        self.models: Dict[str, ClassModel] = {c: ClassModel() for c in RUNTIME_CLASSES}
+        self.models = _class_models()
 
     def model_for(self, job: Job) -> ClassModel:
         return self.models[runtime_class(job.predicted_runtime)]
 
-    def observe(self, job: Job) -> None:
-        self.model_for(job).observe(job.predicted_runtime, job.actual_runtime)
+    def observe(self, obs: Observation) -> None:
+        model = self.models[runtime_class(obs.predicted_runtime)]
+        model.observe(obs.predicted_runtime, obs.runtime, obs.censored)
 
     def head_allocation(self, job: Job) -> float:
         return self.model_for(job).tewma_estimate(job.predicted_runtime, self.confidence)
@@ -118,23 +153,24 @@ class KnnTewmaCA(Scheduler):
         self,
         total_nodes: int = 8,
         confidence: float = 0.80,
-        reservation_view: ReservationView = ReservationView.ALLOCATED_END,
+        methodology: Methodology = CORRECTED,
         k: int = 8,
     ) -> None:
-        super().__init__(total_nodes, reservation_view)
+        super().__init__(total_nodes, methodology)
         self.confidence = confidence
         self.k = k
 
     def reset(self) -> None:
-        self.models: Dict[str, ClassModel] = {c: ClassModel() for c in RUNTIME_CLASSES}
+        self.models = _class_models()
         self.pressure = QueuePressure()
         self.current_confidence = self.confidence
 
     def model_for(self, job: Job) -> ClassModel:
         return self.models[runtime_class(job.predicted_runtime)]
 
-    def observe(self, job: Job) -> None:
-        self.model_for(job).observe(job.predicted_runtime, job.actual_runtime)
+    def observe(self, obs: Observation) -> None:
+        model = self.models[runtime_class(obs.predicted_runtime)]
+        model.observe(obs.predicted_runtime, obs.runtime, obs.censored)
 
     def before_dispatch(
         self, now: float, waiting: Sequence[Job], free_nodes: int, running_jobs: List[Job]
@@ -147,7 +183,12 @@ class KnnTewmaCA(Scheduler):
         )
 
     def estimate(self, job: Job) -> float:
-        return self.model_for(job).knn_estimate(job.predicted_runtime, self.current_confidence, self.k)
+        return self.model_for(job).knn_estimate(
+            job.predicted_runtime,
+            self.current_confidence,
+            self.k,
+            stack_on_bias_correction=self.methodology.knn_stacks_on_bias_correction,
+        )
 
     def head_allocation(self, job: Job) -> float:
         return self.estimate(job)
@@ -210,11 +251,11 @@ def make_scheduler(
     name: str,
     total_nodes: int = 8,
     confidence: float = 0.80,
-    reservation_view: ReservationView = ReservationView.ALLOCATED_END,
+    methodology: Methodology = CORRECTED,
 ) -> Scheduler:
     """Build a scheduler by display name."""
     if name == EasyBaseline.name:
-        return EasyBaseline(total_nodes, reservation_view)
+        return EasyBaseline(total_nodes, methodology)
     if name in SCHEDULERS:
-        return SCHEDULERS[name](total_nodes, confidence, reservation_view)
+        return SCHEDULERS[name](total_nodes, confidence, methodology)
     raise KeyError(f"unknown scheduler {name!r}; choose from {', '.join(SCHEDULERS)}")

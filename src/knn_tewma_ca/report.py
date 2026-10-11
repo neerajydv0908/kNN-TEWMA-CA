@@ -8,19 +8,22 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from .experiments import (
+    ABLATION_STEPS,
     ALL_SCHEDULERS,
     CONFIDENCE_LEVELS,
+    FIXED_PADDING,
     Mode,
     Run,
     select,
     values,
     xs_in,
 )
-from .metrics import HIGHER_IS_BETTER, METRIC_LABELS, METRIC_NAMES, display_digits
-from .schedulers import KnnTewmaCA, TewmaScheduler, EasyBaseline
+from .metrics import HIGHER_IS_BETTER, METRIC_LABELS, METRIC_NAMES, SLIDE_METRICS, display_digits
+from .schedulers import EasyBaseline, KnnTewmaCA, TewmaScheduler
 from .stats import paired_comparison, summarize
 
 Results = Dict[str, List[Run]]
+Ablation = Dict[str, Dict[str, List[Run]]]
 
 CA = KnnTewmaCA.name
 TEWMA = TewmaScheduler.name
@@ -34,6 +37,7 @@ _AGG_DIGITS = {
     "success_rate": 3,
     "utilization": 3,
     "avg_slowdown": 2,
+    "allocation_ratio": 2,
 }
 
 GUARANTEE_NOTE = (
@@ -58,12 +62,12 @@ def _pm(vals: Sequence[float], metric: str) -> str:
     return f"{s.mean:.{d}f} ± {s.std:.{d}f}"
 
 
+def _mean(vals: Sequence[float], metric: str) -> str:
+    return f"{summarize(vals).mean:.{_AGG_DIGITS[metric]}f}"
+
+
 def _pct(fraction: float) -> str:
     return f"{fraction * 100:+.1f}%"
-
-
-def _signed(value: float, metric: str) -> str:
-    return f"{value:+.{_AGG_DIGITS[metric]}f}"
 
 
 def _ci(summary, metric: str) -> str:
@@ -97,15 +101,20 @@ def _rounded(run: Run, metric: str) -> float:
     return run.metrics.rounded()[metric]
 
 
+def _better(pc, metric: str) -> str:
+    return "—" if HIGHER_IS_BETTER[metric] is None else f"{pc.better}/{pc.n}"
+
+
 # -- reproduce ----------------------------------------------------------------
 def reproduce_markdown(results: Results) -> str:
     """Tables in the same shape as the Round 2 slides and write-up."""
     out: List[str] = [
         "# Round 2 presentation, reproduced",
         "",
-        "Reservations planned from true finish times, one seed per experiment "
-        "(E1 and E2: 42, E3: 99, E4: 7). These are the numbers in the slides and "
-        "the write-up, produced by `knn-tewma-ca reproduce`.",
+        "Round 2 methodology (reservations planned from true finish times, schedulers told "
+        "killed jobs' true runtimes, at most one queue-head start per event with no backfilling "
+        "at that event, kNN stacked on the TEWMA bias correction) and one seed per experiment (E1 and E2: 42, E3: 99, E4: 7). These are "
+        "the numbers in the slides and the write-up, produced by `knn-tewma-ca reproduce`.",
         "",
         "## E1 · Baseline comparison (300 jobs, 8 nodes, p = 0.80)",
         "",
@@ -113,7 +122,7 @@ def reproduce_markdown(results: Results) -> str:
     e1 = results["E1"]
     by = {name: select(e1, name)[0] for name in ALL_SCHEDULERS}
     rows = []
-    for m in METRIC_NAMES:
+    for m in SLIDE_METRICS:
         b, t, c = (_rounded(by[n], m) for n in ALL_SCHEDULERS)
         rel = (c - b) / b if b else math.nan
         rows.append([METRIC_LABELS[m], _fixed(b, m), _fixed(t, m), _fixed(c, m), _pct(rel)])
@@ -147,7 +156,7 @@ def reproduce_markdown(results: Results) -> str:
     ]
     t_run, c_run = select(results["E4"], TEWMA)[0], select(results["E4"], CA)[0]
     rows = []
-    for m in METRIC_NAMES:
+    for m in SLIDE_METRICS:
         tv, cv = _rounded(t_run, m), _rounded(c_run, m)
         rows.append([METRIC_LABELS[m], _fixed(tv, m), _fixed(cv, m), _pct((cv - tv) / tv)])
     out += [_table(["Metric", TEWMA, CA, "Δ"], rows), ""]
@@ -158,13 +167,15 @@ def reproduce_markdown(results: Results) -> str:
 def corrected_markdown(results: Results, mode: Mode) -> str:
     n = mode.seed_count
     out: List[str] = [
-        f"# Main results: allocated-end reservations, {n} seeds",
+        f"# Main results: corrected methodology, {n} seeds",
         "",
         f"Each cell is the mean ± sample standard deviation over {n} workloads "
-        f"(seeds {_seed_text(mode.e1_seeds)}). Every scheduler runs on the same workloads, "
-        "so the comparisons below are paired by seed. Brackets are 95% confidence "
-        "intervals for the mean difference (Student t). \"Better in\" counts the seeds "
-        "where kNN-TEWMA-CA is strictly better.",
+        f"(seeds {_seed_text(mode.e1_seeds)}). Every scheduler runs on the same workloads, so the "
+        "comparisons are paired by seed. Brackets are 95% confidence intervals for the mean "
+        "difference (Student t). \"Better in\" counts the seeds where kNN-TEWMA-CA is strictly "
+        "better. \"Allocated / needed node-time\" is sum(allocated x nodes) / sum(actual x nodes): "
+        "how much capacity a scheduler reserves relative to what jobs needed (neither direction is "
+        "simply better).",
         "",
         "## E1 · Baseline comparison (300 jobs, 8 nodes, p = 0.80)",
         "",
@@ -179,7 +190,7 @@ def corrected_markdown(results: Results, mode: Mode) -> str:
     out += [_paired_table(e1, CA, (BASELINE, TEWMA)), ""]
 
     out += ["## E2 · Confidence sweep (kNN-TEWMA-CA, 300 jobs)", ""]
-    e2_metrics = ("success_rate", "utilization", "avg_wait", "avg_slowdown")
+    e2_metrics = ("success_rate", "utilization", "avg_wait", "avg_slowdown", "allocation_ratio")
     rows = []
     for p in xs_in(results["E2"]):
         runs = select(results["E2"], CA, p)
@@ -209,6 +220,9 @@ def corrected_markdown(results: Results, mode: Mode) -> str:
     refs = tuple(s for s in (TEWMA, BASELINE) if s in mode.e4_schedulers)
     out += [_paired_table(e4, CA, refs), ""]
 
+    if "E5" in results:
+        out += [e5_markdown(results["E5"]), ""]
+
     total = sum(len(v) for v in results.values())
     out += [
         "## Reservation guarantee",
@@ -216,6 +230,40 @@ def corrected_markdown(results: Results, mode: Mode) -> str:
         GUARANTEE_NOTE + f" It held in all {total} simulations above, as it must.",
         "",
     ]
+    return "\n".join(out)
+
+
+def e5_markdown(runs: Sequence[Run]) -> str:
+    out = [
+        "## E5 · What success costs",
+        "",
+        "Each row is one setting, averaged over seeds. \"Fixed padding\" is the baseline with "
+        "every allocation multiplied by a constant factor; TEWMA and kNN-TEWMA-CA are swept over "
+        "their base confidence p. Comparing rows with similar allocated node-time shows how much "
+        "success each approach gets for the capacity it reserves; comparing rows with similar success "
+        "shows what that success costs in queue time and utilization.",
+        "",
+    ]
+    for workload, title in (("default", "E1 workload (unbiased predictions)"),
+                            ("stress", "E4 workload (users under-predict by 25%)")):
+        rows = []
+        for name in (FIXED_PADDING, TEWMA, CA):
+            sel = select(runs, name, workload=workload)
+            for x in xs_in(sel):
+                cell = select(sel, x=x)
+                setting = f"× {x:g}" if name == FIXED_PADDING else f"p = {x:.2f}"
+                rows.append(
+                    [name, setting]
+                    + [_mean(values(cell, m), m) for m in ("allocation_ratio", "success_rate", "utilization", "avg_wait")]
+                )
+        out += [
+            f"### {title}",
+            "",
+            _table(["Scheduler", "Setting", "Allocated / needed node-time", "Success rate", "Utilization",
+                    "Avg wait"],
+                   rows, "llrrrr"),
+            "",
+        ]
     return "\n".join(out)
 
 
@@ -228,79 +276,85 @@ def _paired_table(runs: Sequence[Run], candidate: str, references: Sequence[str]
     for m in METRIC_NAMES:
         row = [METRIC_LABELS[m]]
         for ref in references:
-            pc = paired_comparison(values(cand, m), values(select(runs, ref), m), HIGHER_IS_BETTER[m])
-            row += [_ci(pc.difference, m), _pct(pc.relative.mean), f"{pc.better}/{pc.n}"]
+            pc = paired_comparison(values(cand, m), values(select(runs, ref), m), bool(HIGHER_IS_BETTER[m]))
+            row += [_ci(pc.difference, m), _pct(pc.relative.mean), _better(pc, m)]
         rows.append(row)
     return _table(header, rows)
 
 
 # -- comparison ---------------------------------------------------------------
-def comparison_markdown(reproduced: Results, same_seeds: Results, main: Results, mode: Mode) -> str:
+_HEADLINE = (
+    ("E1", "success_rate", BASELINE),
+    ("E1", "utilization", BASELINE),
+    ("E1", "avg_wait", BASELINE),
+    ("E1", "avg_slowdown", BASELINE),
+    ("E4", "success_rate", TEWMA),
+    ("E4", "utilization", TEWMA),
+    ("E4", "avg_wait", TEWMA),
+)
+
+
+def comparison_markdown(reproduced: Results, main: Results, ablation: Ablation, mode: Mode) -> str:
     n = mode.seed_count
     out: List[str] = [
         "# Presentation numbers vs corrected methodology",
         "",
-        "* **Slides**: the Round 2 numbers (one seed, reservations planned from true finish times).",
-        "* **Same seed, allocated-end**: identical workloads, but reservations only use what a real "
-        "scheduler knows (start time + allocated runtime). This isolates that fix.",
-        f"* **{n} seeds**: the main version. Mean ± standard deviation over seeds "
-        f"{_seed_text(mode.e1_seeds)}.",
+        "* **Slides**: the Round 2 numbers (one seed, Round 2 methodology).",
+        f"* **Corrected**: every methodology fix applied, mean over {n} seeds "
+        f"({_seed_text(mode.e1_seeds)}), with the 95% CI of the paired per-seed change.",
         "",
         "## Headline claims",
         "",
     ]
     rows = []
-    for exp, metric, ref in (
-        ("E1", "success_rate", BASELINE),
-        ("E1", "utilization", BASELINE),
-        ("E1", "avg_wait", BASELINE),
-        ("E1", "avg_slowdown", BASELINE),
-        ("E4", "success_rate", TEWMA),
-        ("E4", "utilization", TEWMA),
-        ("E4", "avg_wait", TEWMA),
-    ):
+    for exp, metric, ref in _HEADLINE:
         slide_c = _rounded(select(reproduced[exp], CA)[0], metric)
         slide_r = _rounded(select(reproduced[exp], ref)[0], metric)
-        same_c = select(same_seeds[exp], CA)[0].metrics.as_dict()[metric]
-        same_r = select(same_seeds[exp], ref)[0].metrics.as_dict()[metric]
         pc = paired_comparison(
             values(select(main[exp], CA), metric),
             values(select(main[exp], ref), metric),
-            HIGHER_IS_BETTER[metric],
+            bool(HIGHER_IS_BETTER[metric]),
         )
         rows.append(
             [
                 f"{exp} {METRIC_LABELS[metric].lower()}, CA vs {ref}",
                 _pct((slide_c - slide_r) / slide_r),
-                _pct((same_c - same_r) / same_r),
                 _ci_pct(pc.relative),
                 f"{pc.better}/{pc.n}",
             ]
         )
-    rows.append(
-        [
-            "Reservation violations",
-            "0 (reported as a result)",
-            "0",
-            "0 for every scheduler, by construction",
-            "n/a",
-        ]
-    )
+    rows.append(["Reservation violations", "0 (reported as a result)",
+                 "0 for every scheduler, by construction", "n/a"])
+    out += [_table(["Claim", "Slides", f"Corrected, {n} seeds: mean [95% CI]", "CA better in"], rows), ""]
+
     out += [
-        _table(
-            ["Claim", "Slides", "Same seed, allocated-end", f"{n} seeds: mean [95% CI]", "CA better in"],
-            rows,
-        ),
+        "## What each fix changes",
         "",
-        "## Every metric",
+        f"The fixes applied one at a time, cumulatively, each over the same {n} seeds. "
+        "The first row is the Round 2 code on 30 seeds instead of one, so the gap between it and "
+        "the slides is the effect of the seed alone. Cells are means.",
         "",
     ]
+    for exp, title in (("E1", "E1 workload"), ("E4", "E4 stress workload")):
+        rows = []
+        for key, label, _m in ABLATION_STEPS:
+            runs = ablation[key][exp]
+            row = [label]
+            for m in ("success_rate", "utilization", "avg_wait", "allocation_ratio"):
+                row += [_mean(values(select(runs, s), m), m) for s in ALL_SCHEDULERS]
+            rows.append(row)
+        header = ["Step"]
+        for m in ("Success", "Utilization", "Avg wait", "Alloc / needed"):
+            header += [f"{m}: B", "T", "CA"]
+        out += [f"### {title}", "", "B = Baseline, T = TEWMA, CA = kNN-TEWMA-CA.", "",
+                _table(header, rows), ""]
+
+    out += ["## Every metric", ""]
     rows = []
     for exp in ("E1", "E4"):
         for m in METRIC_NAMES:
             for s in ALL_SCHEDULERS:
                 rep = select(reproduced[exp], s)
-                same = select(same_seeds[exp], s)
                 main_runs = select(main[exp], s)
                 if not main_runs:
                     continue
@@ -309,29 +363,25 @@ def comparison_markdown(reproduced: Results, same_seeds: Results, main: Results,
                         f"{exp} {METRIC_LABELS[m]}",
                         s,
                         _fixed(_rounded(rep[0], m), m) if rep else "—",
-                        _fixed(_rounded(same[0], m), m) if same else "—",
                         _pm(values(main_runs, m), m),
                     ]
                 )
-    out += [
-        _table(["Metric", "Scheduler", "Slides", "Same seed, allocated-end", f"{n} seeds"], rows, "llrrr"),
-        "",
-    ]
+    out += [_table(["Metric", "Scheduler", "Round 2 (slide seed)", f"Corrected, {n} seeds"], rows, "llrr"), ""]
     return "\n".join(out)
 
 
 # -- raw data -------------------------------------------------------------------
-def write_runs_csv(path: Path, all_results: Dict[str, Results]) -> None:
+def write_runs_csv(path: Path, groups: Sequence[Results]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as fh:
         writer = csv.writer(fh)
-        writer.writerow(["mode", "experiment", "scheduler", "seed", "x"] + list(METRIC_NAMES))
-        for results in all_results.values():
+        writer.writerow(["mode", "experiment", "scheduler", "workload", "seed", "x"] + list(METRIC_NAMES))
+        for results in groups:
             for runs in results.values():
                 for r in runs:
                     x = "" if math.isnan(r.x) else f"{r.x:g}"
                     metrics = r.metrics.as_dict()
                     writer.writerow(
-                        [r.mode, r.experiment, r.scheduler, r.seed, x]
+                        [r.mode, r.experiment, r.scheduler, r.workload, r.seed, x]
                         + [f"{metrics[m]:.6f}" for m in METRIC_NAMES]
                     )

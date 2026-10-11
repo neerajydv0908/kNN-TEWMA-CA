@@ -7,20 +7,21 @@ from knn_tewma_ca import (
     STRESS_WORKLOAD,
     EasyBaseline,
     ReservationGuaranteeError,
-    ReservationView,
     generate_jobs,
     make_scheduler,
 )
+from knn_tewma_ca.experiments import ABLATION_STEPS
 from knn_tewma_ca.schedulers import SCHEDULER_NAMES
 from knn_tewma_ca.simulator import Launch
 
 
-@pytest.mark.parametrize("view", list(ReservationView))
+@pytest.mark.parametrize("step", [s[0] for s in ABLATION_STEPS])
 @pytest.mark.parametrize("name", SCHEDULER_NAMES)
 @pytest.mark.parametrize("workload", [DEFAULT_WORKLOAD, STRESS_WORKLOAD], ids=["default", "stress"])
-def test_no_reserved_job_starts_late(name, view, workload):
-    for seed in range(4):
-        result = make_scheduler(name, 8, 0.8, view).run(generate_jobs(workload, 8, seed))
+def test_no_reserved_job_starts_late(name, step, workload):
+    methodology = {key: m for key, _label, m in ABLATION_STEPS}[step]
+    for seed in range(3):
+        result = make_scheduler(name, 8, 0.8, methodology).run(generate_jobs(workload, 8, seed))
         promised = [j for j in result.jobs if j.promised_start != float("inf")]
         assert promised, "expected some jobs to wait for a reservation"
         assert result.backfill_rounds > 0

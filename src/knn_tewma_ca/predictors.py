@@ -7,8 +7,13 @@ long). It combines two estimators:
   relative prediction bias and its variance, turned into a confidence
   quantile of the runtime.
 * **kNN refinement**: an inverse-distance weighted average of the
-  actual/predicted ratio of the most similar past jobs, applied on top of
-  the TEWMA estimate.
+  actual/predicted ratio of the most similar past jobs. It replaces TEWMA's
+  class-wide bias correction with a local one and keeps TEWMA's safety margin.
+
+Killed jobs are censored observations: the scheduler only learns that the job
+needed more than its allocation. ``ClassModel.observe`` reconstructs such a
+job's runtime as its expected value under the class's error model, given that
+it outlived its allocation, and learns from that.
 
 ``QueuePressure`` turns the state of the queue into a smoothed congestion
 level in [0, 1] that the contention-aware scheduler uses to tighten its
@@ -37,6 +42,14 @@ RECENT_ERRORS = 20
 WARMUP_OBSERVATIONS = 3
 #: Padding used before a class has enough history to trust its statistics.
 COLD_START_PADDING = 1.25
+
+# Censored observations ------------------------------------------------------
+#: Lower limit on the relative error when reconstructing a killed job: a job
+#: is assumed to run at most 20x its prediction.
+MIN_RELATIVE_ERROR = -0.95
+#: Floor on the error spread used for reconstruction, so the first killed jobs
+#: of a class (before it has a variance estimate) are not pinned to their bound.
+MIN_RECONSTRUCTION_STD = 0.1
 
 # kNN ----------------------------------------------------------------------
 HISTORY_SIZE = 100
@@ -70,6 +83,38 @@ def inv_normal_cdf(p: float) -> float:
     return sign * (t - num / den)
 
 
+def _normal_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+
+def _normal_cdf(x: float) -> float:
+    return 0.5 * math.erfc(-x / math.sqrt(2))
+
+
+def truncated_normal_moments(mu: float, sigma: float, lo: float, hi: float) -> Tuple[float, float]:
+    """Mean and variance of N(mu, sigma^2) restricted to [lo, hi].
+
+    Falls back to the tail asymptotics when the interval holds almost no
+    probability mass (the mass then piles up at the edge nearest the mean).
+    """
+    if hi <= lo:
+        return hi, 0.0
+    a, b = (lo - mu) / sigma, (hi - mu) / sigma
+    mass = _normal_cdf(b) - _normal_cdf(a)
+    if mass > 1e-12:
+        pa, pb = _normal_pdf(a), _normal_pdf(b)
+        mean = mu + sigma * (pa - pb) / mass
+        var = sigma * sigma * (1 + (a * pa - b * pb) / mass - ((pa - pb) / mass) ** 2)
+        return min(hi, max(lo, mean)), max(0.0, var)
+    if mu >= hi:
+        shift = sigma * sigma / (mu - hi) if mu > hi else sigma
+        return max(lo, hi - shift), shift * shift
+    if mu <= lo:
+        shift = sigma * sigma / (lo - mu) if mu < lo else sigma
+        return min(hi, lo + shift), shift * shift
+    return (lo + hi) / 2, 0.0  # a sliver of an interval around the mean
+
+
 @dataclass
 class ClassModel:
     """Runtime model for one runtime class."""
@@ -85,11 +130,34 @@ class ClassModel:
     #: slowly so a single outlier does not set the cap forever.
     max_observed_ratio: float = INITIAL_RATIO_CAP
 
-    def observe(self, predicted: float, actual: float) -> None:
-        """Learn from a finished job."""
-        if actual <= 0:
-            return
-        rel_error = (predicted - actual) / actual
+    def reconstruct(self, predicted: float, ran_for: float) -> Tuple[float, float]:
+        """Expected relative error of a job killed after ``ran_for``, and its variance.
+
+        The job's true runtime is longer than ``ran_for``, so its relative
+        error ``(predicted - actual) / actual`` is below
+        ``predicted / ran_for - 1``. Under the class's current error model
+        N(bias, variance) this is a truncated normal; its mean and variance
+        are what the model learns from (an online EM step).
+        """
+        hi = predicted / ran_for - 1
+        sigma = max(math.sqrt(self.variance), MIN_RECONSTRUCTION_STD)
+        return truncated_normal_moments(self.bias, sigma, MIN_RELATIVE_ERROR, hi)
+
+    def observe(self, predicted: float, runtime: float, censored: bool = False) -> float:
+        """Learn from a job that left the cluster.
+
+        ``runtime`` is how long the job ran. If ``censored``, the job was
+        killed and its true runtime is only known to be longer; the model
+        reconstructs it first. Returns the runtime the model learned from.
+        """
+        if runtime <= 0:
+            return runtime
+        extra_variance = 0.0
+        if censored:
+            rel_error, extra_variance = self.reconstruct(predicted, runtime)
+            runtime = predicted / (1 + rel_error)
+        else:
+            rel_error = (predicted - runtime) / runtime
         self.recent_errors.append(rel_error)
         self.count += 1
 
@@ -105,16 +173,24 @@ class ClassModel:
 
         self.bias = (1 - self.alpha) * self.bias + self.alpha * rel_error
         sq_dev = (rel_error - self.bias) ** 2
+        if censored:
+            # Expected squared deviation also carries the reconstruction's own spread.
+            sq_dev += extra_variance
         self.variance = (1 - self.alpha) * self.variance + self.alpha * sq_dev
 
         if predicted > 0:
-            ratio = actual / predicted
+            ratio = runtime / predicted
             self.max_observed_ratio = max(
                 self.max_observed_ratio * RATIO_CAP_DECAY,
                 ratio * RATIO_CAP_HEADROOM,
             )
 
-        self.history.append((predicted, actual))
+        self.history.append((predicted, runtime))
+        return runtime
+
+    def safety_margin(self, confidence: float) -> float:
+        """Multiplier that pads a point estimate to the given confidence level."""
+        return max(0.5, 1.0 + inv_normal_cdf(confidence) * math.sqrt(self.variance))
 
     def tewma_estimate(self, predicted: float, confidence: float = 0.80) -> float:
         """TEWMA runtime estimate at the given confidence level.
@@ -130,14 +206,25 @@ class ClassModel:
         quantile_bound = bias_corrected * max(0.5, 1.0 + z * std)
         return max(predicted * 0.9, quantile_bound)
 
-    def knn_estimate(self, predicted: float, confidence: float = 0.80, k: int = DEFAULT_K) -> float:
-        """kNN-refined TEWMA estimate.
+    def knn_estimate(
+        self,
+        predicted: float,
+        confidence: float = 0.80,
+        k: int = DEFAULT_K,
+        stack_on_bias_correction: bool = False,
+    ) -> float:
+        """kNN-refined runtime estimate.
 
         Finds the ``k`` past jobs whose predictions are closest in log space
-        (so a 2s job and a 20s job are as far apart as a 20s and a 200s job),
-        takes an inverse-distance weighted average of their actual/predicted
-        ratios, and scales the TEWMA estimate by it. The result is clamped to
+        (so a 2s job and a 20s job are as far apart as a 20s and a 200s job)
+        and takes an inverse-distance weighted average of their
+        actual/predicted ratios. That local ratio replaces TEWMA's class-wide
+        bias correction: the estimate is ``predicted x ratio x margin``, with
+        the same confidence margin TEWMA uses. The result is clamped to
         ``[0.6, min(max_observed_ratio, 5)] x predicted``.
+
+        ``stack_on_bias_correction=True`` reproduces the Round 2 version, which
+        multiplied the ratio onto the already bias-corrected TEWMA estimate.
         """
         if len(self.history) < max(k, WARMUP_OBSERVATIONS) or self.count < WARMUP_OBSERVATIONS:
             return self.tewma_estimate(predicted, confidence)
@@ -163,7 +250,10 @@ class ClassModel:
         total_w = sum(weights)
         avg_ratio = sum(w * r for w, r in zip(weights, ratios)) / total_w if total_w > 0 else 1.0
 
-        corrected = self.tewma_estimate(predicted, confidence) * avg_ratio
+        if stack_on_bias_correction:
+            corrected = self.tewma_estimate(predicted, confidence) * avg_ratio
+        else:
+            corrected = predicted * avg_ratio * self.safety_margin(confidence)
         hard_cap = predicted * min(self.max_observed_ratio, MAX_RATIO_CAP)
         return max(predicted * KNN_FLOOR, min(corrected, hard_cap))
 

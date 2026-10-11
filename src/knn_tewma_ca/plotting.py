@@ -16,7 +16,16 @@ from matplotlib.lines import Line2D
 from matplotlib.ticker import FuncFormatter
 from matplotlib.transforms import ScaledTranslation
 
-from .experiments import ALL_SCHEDULERS, Mode, Run, select, values, xs_in
+from .experiments import (
+    ABLATION_STEPS,
+    ALL_SCHEDULERS,
+    FIXED_PADDING,
+    Mode,
+    Run,
+    select,
+    values,
+    xs_in,
+)
 from .metrics import METRIC_LABELS
 from .schedulers import KnnTewmaCA, TewmaScheduler
 from .stats import summarize
@@ -34,6 +43,7 @@ SERIES_COLORS = {
     "Baseline": "#2a78d6",
     "TEWMA": "#eb6834",
     "kNN-TEWMA-CA": "#1baf7a",
+    FIXED_PADDING: INK_2,
 }
 
 _VALUE_FORMAT = {
@@ -43,6 +53,7 @@ _VALUE_FORMAT = {
     "success_rate": "{:.3f}",
     "utilization": "{:.3f}",
     "avg_slowdown": "{:.2f}",
+    "allocation_ratio": "{:.2f}",
 }
 
 _RC = {
@@ -51,13 +62,15 @@ _RC = {
     "font.size": 9,
 }
 
-SLIDES_LABEL = "Round 2 slides (one seed)"
+SLIDES_LABEL = "Round 2 code, slide seed"
 
 
-def _figure(ncols: int, title: str, subtitle: str = "", width: float = 3.6, height: float = 3.4) -> tuple:
-    fig = Figure(figsize=(width * ncols, height), facecolor=SURFACE, layout="constrained")
-    axes = fig.subplots(1, ncols, squeeze=False)[0]
-    for ax in axes:
+def _figure(ncols: int, title: str, subtitle: str = "", width: float = 3.6, height: float = 3.4,
+            nrows: int = 1) -> tuple:
+    fig = Figure(figsize=(width * ncols, height * nrows), facecolor=SURFACE, layout="constrained")
+    grid = fig.subplots(nrows, ncols, squeeze=False)
+    axes = grid[0] if nrows == 1 else grid
+    for ax in grid.flat:
         _style(ax)
     # The suptitle gets a blank second line so constrained layout reserves room
     # for the subtitle, which is then drawn one title-line below the top.
@@ -214,7 +227,7 @@ def corrected_figures(main: Results, mode: Mode, reproduced: Optional[Results], 
     with matplotlib.rc_context(_RC):
         # E1 ------------------------------------------------------------------
         for name, metrics in (
-            ("e1_efficiency.png", ("success_rate", "utilization")),
+            ("e1_efficiency.png", ("success_rate", "utilization", "allocation_ratio")),
             ("e1_time.png", ("avg_wait", "avg_turnaround", "avg_slowdown")),
         ):
             fig, axes = _figure(len(metrics), "E1 · Baseline comparison",
@@ -254,7 +267,7 @@ def corrected_figures(main: Results, mode: Mode, reproduced: Optional[Results], 
         paths.append(_save(fig, out_dir / "e3_load.png"))
 
         # E4 ------------------------------------------------------------------
-        metrics = ("success_rate", "utilization", "avg_wait")
+        metrics = ("success_rate", "utilization", "avg_wait", "allocation_ratio")
         scheds = [s for s in ALL_SCHEDULERS if s in mode.e4_schedulers]
         fig, axes = _figure(len(metrics), "E4 · High-contention stress",
                             f"150 jobs, 8x arrival rate, users under-predict by 25%, {n} seeds")
@@ -266,7 +279,92 @@ def corrected_figures(main: Results, mode: Mode, reproduced: Optional[Results], 
             _strip_panel(ax, m, scheds, samples, ref)
         _legend(fig, _strip_handles(n, reproduced is not None))
         paths.append(_save(fig, out_dir / "e4_stress.png"))
+
+        if "E5" in main:
+            paths.append(_e5_figure(main, n, out_dir / "e5_allocation.png"))
     return paths
+
+
+def _e5_figure(main: Results, n: int, path: Path) -> Path:
+    """Success against reserved capacity (top) and against queue time (bottom), both workloads."""
+    fig, grid = _figure(2, "E5 · What success costs",
+                        f"Mean over {n} seeds. Each line sweeps one knob: the padding factor, or the base "
+                        "confidence p. Large dots: the settings used in E1 and E4.",
+                        width=4.6, height=3.5, nrows=2)
+    workloads = (("default", "E1 workload (unbiased predictions)", "E1"),
+                 ("stress", "E4 workload (users under-predict by 25%)", "E4"))
+    for row, (x_metric, x_label) in zip(
+        grid, (("allocation_ratio", "Allocated / needed node-time"), ("avg_wait", "Average wait"))
+    ):
+        for ax, (workload, title, experiment) in zip(row, workloads):
+            for name in (FIXED_PADDING, TewmaScheduler.name, KnnTewmaCA.name):
+                sel = select(main["E5"], name, workload=workload)
+                xs = xs_in(sel)
+                xv = [summarize(values(select(sel, x=x), x_metric)).mean for x in xs]
+                succ = [summarize(values(select(sel, x=x), "success_rate")).mean for x in xs]
+                color = SERIES_COLORS[name]
+                hollow = name == FIXED_PADDING
+                ax.plot(xv, succ, color=color, linewidth=1.4 if hollow else 2, marker="o", markersize=4.5,
+                        markerfacecolor=SURFACE if hollow else color,
+                        markeredgecolor=color if hollow else SURFACE, markeredgewidth=1.2, zorder=3)
+                if hollow:
+                    for x, a, sv in zip(xs, xv, succ):
+                        if x in (1.0, 1.5, 2.0):
+                            ax.annotate(f"×{x:g}", (a, sv), xytext=(5, -10), textcoords="offset points",
+                                        fontsize=7.5, color=INK_2)
+            # Operating points from the main experiment.
+            for name in ALL_SCHEDULERS:
+                runs = select(main[experiment], name)
+                if not runs:
+                    continue
+                xv = summarize(values(runs, x_metric)).mean
+                sv = summarize(values(runs, "success_rate")).mean
+                ax.scatter([xv], [sv], s=70, color=SERIES_COLORS[name], edgecolors=SURFACE, linewidths=2, zorder=5)
+            ax.set_xlabel(x_label, color=INK_2, fontsize=8.5)
+            if x_metric == "allocation_ratio":
+                ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.1f}×"))
+            ax.set_ylabel("Success rate", color=INK_2, fontsize=8.5)
+            _panel_title(ax, title)
+            ax.grid(axis="x", color=GRID, linewidth=0.8)
+    handles = [
+        Line2D([], [], color=INK_2, linewidth=1.4, marker="o", markersize=4.5, markerfacecolor=SURFACE,
+               markeredgecolor=INK_2, label="Fixed padding (Baseline × 1.0–2.0)"),
+        Line2D([], [], color=SERIES_COLORS[TewmaScheduler.name], linewidth=2, marker="o", markersize=4.5,
+               markeredgecolor=SURFACE, label="TEWMA (p 0.60–0.99)"),
+        Line2D([], [], color=SERIES_COLORS[KnnTewmaCA.name], linewidth=2, marker="o", markersize=4.5,
+               markeredgecolor=SURFACE, label="kNN-TEWMA-CA (p 0.55–0.90)"),
+        Line2D([], [], linestyle="none", marker="o", markersize=8, color=SERIES_COLORS["Baseline"],
+               markeredgecolor=SURFACE, label="Baseline (adaptive padding)"),
+    ]
+    _legend(fig, handles)
+    return _save(fig, path)
+
+
+ABLATION_SHORT = ("Round 2\ncode", "+ allocated\nend", "+ all heads\nstart", "+ censored\nlearning", "+ kNN\nfix")
+
+
+def ablation_figure(ablation: Dict[str, Results], n: int, out_dir: Path) -> Path:
+    """How each methodology fix moves the main metrics, E1 and E4 workloads."""
+    import matplotlib
+
+    metrics = ("success_rate", "utilization", "avg_wait")
+    with matplotlib.rc_context(_RC):
+        fig, grid = _figure(len(metrics), "What each fix changes",
+                            f"Fixes applied cumulatively, left to right; mean over {n} seeds with 95% CI. "
+                            "Top: E1 workload. Bottom: E4 stress workload.", width=3.9, height=3.0, nrows=2)
+        xs = list(range(len(ABLATION_STEPS)))
+        for row, exp in zip(grid, ("E1", "E4")):
+            for ax, m in zip(row, metrics):
+                samples = {
+                    s: [values(select(ablation[key][exp], s), m) for key, _l, _m in ABLATION_STEPS]
+                    for s in ALL_SCHEDULERS
+                }
+                _line_panel(ax, m, xs, samples)
+                ax.set_xticks(xs)
+                ax.set_xticklabels(ABLATION_SHORT, fontsize=7.5)
+                ax.set_title(f"{METRIC_LABELS[m]} · {exp}", loc="left", color=INK, fontsize=10, pad=8)
+        _legend(fig, _series_handles(ALL_SCHEDULERS))
+        return _save(fig, out_dir / "ablation.png")
 
 
 # Single-seed (reproduce) figures --------------------------------------------------

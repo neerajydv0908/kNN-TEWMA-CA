@@ -3,6 +3,7 @@
 import pytest
 
 from knn_tewma_ca import experiments as ex
+from knn_tewma_ca.metrics import SLIDE_METRICS
 
 SLIDES_E1 = {
     "Baseline": dict(makespan=2202.20, avg_wait=70.66, avg_turnaround=89.67,
@@ -46,7 +47,8 @@ def reproduced():
 def _rounded(runs, scheduler, x=None):
     selected = ex.select(runs, scheduler, x)
     assert len(selected) == 1
-    return selected[0].metrics.rounded()
+    rounded = selected[0].metrics.rounded()
+    return {m: rounded[m] for m in SLIDE_METRICS}
 
 
 @pytest.mark.parametrize("scheduler", list(SLIDES_E1))

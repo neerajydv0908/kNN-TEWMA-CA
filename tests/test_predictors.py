@@ -4,7 +4,7 @@ import random
 import pytest
 
 from knn_tewma_ca.job import Job
-from knn_tewma_ca.predictors import ClassModel, QueuePressure, inv_normal_cdf
+from knn_tewma_ca.predictors import ClassModel, QueuePressure, inv_normal_cdf, truncated_normal_moments
 
 
 @pytest.mark.parametrize(
@@ -45,14 +45,16 @@ def test_perfect_predictions_are_trusted():
 def test_learns_systematic_under_prediction():
     model = ClassModel()
     for _ in range(300):
-        model.observe(predicted=40, actual=80)
+        model.observe(predicted=40, runtime=80)
     assert model.bias == pytest.approx(-0.5, abs=1e-6)
     # TEWMA removes the bias: 40 / (1 - 0.5) = 80.
     assert model.tewma_estimate(40) == pytest.approx(80, rel=1e-6)
-    # kNN multiplies the already bias-corrected TEWMA estimate by the
-    # neighbours' ratio (2x again), so the class cap (ratio 2 x 1.1 headroom)
-    # is what bounds it.
-    assert model.knn_estimate(40) == pytest.approx(40 * 2.2, rel=1e-6)
+    # kNN replaces the class-wide bias correction with the neighbours' ratio
+    # (2x), so the bias is corrected once.
+    assert model.knn_estimate(40) == pytest.approx(80, rel=1e-6)
+    # The Round 2 version stacked the ratio on the bias-corrected estimate
+    # (4x), and only the class cap (ratio 2 x 1.1 headroom) bounded it.
+    assert model.knn_estimate(40, stack_on_bias_correction=True) == pytest.approx(40 * 2.2, rel=1e-6)
     assert model.trust_score < 0.6
 
 
@@ -120,3 +122,63 @@ def test_pressure_rises_with_backlog_and_decays_when_idle():
         qp.update([], free_nodes=8, running_jobs=[])
     assert qp.pressure_ema < 0.01
     assert math.isfinite(qp.window_factor())
+
+
+def _numeric_truncated_moments(mu, sigma, lo, hi, steps=200000):
+    width = (hi - lo) / steps
+    xs = [lo + (i + 0.5) * width for i in range(steps)]
+    ws = [math.exp(-0.5 * ((x - mu) / sigma) ** 2) for x in xs]
+    total = sum(ws)
+    mean = sum(w * x for w, x in zip(ws, xs)) / total
+    var = sum(w * (x - mean) ** 2 for w, x in zip(ws, xs)) / total
+    return mean, var
+
+
+@pytest.mark.parametrize(
+    "mu, sigma, lo, hi",
+    [(0.0, 0.3, -0.95, 0.0), (0.1, 0.2, -0.95, -0.2), (-0.3, 0.5, -0.95, -0.25), (0.0, 1.0, -0.95, 2.0)],
+)
+def test_truncated_normal_moments_match_numeric_integration(mu, sigma, lo, hi):
+    mean, var = truncated_normal_moments(mu, sigma, lo, hi)
+    num_mean, num_var = _numeric_truncated_moments(mu, sigma, lo, hi)
+    assert mean == pytest.approx(num_mean, abs=1e-4)
+    assert var == pytest.approx(num_var, abs=1e-4)
+
+
+def test_truncated_normal_far_tail_stays_inside_the_interval():
+    mean, var = truncated_normal_moments(2.0, 0.1, -0.95, -0.5)  # 25 sigma away
+    assert -0.95 <= mean <= -0.5
+    assert mean > -0.51  # mass piles up at the edge nearest the mean
+    assert var >= 0.0
+
+
+def test_censored_observation_is_reconstructed_beyond_its_bound():
+    model = ClassModel()
+    for _ in range(10):
+        model.observe(20, 22)
+    learned = model.observe(20, 25, censored=True)  # killed after 25
+    assert learned > 25
+    assert model.history[-1] == (20, learned)
+
+
+def test_censoring_still_learns_that_jobs_run_long():
+    # Every job really runs 1.5x its prediction and is killed at 1.2x. The
+    # model never sees a true runtime, but it should still learn to allocate
+    # more than the 1.2x it keeps getting killed at.
+    model = ClassModel()
+    for _ in range(60):
+        model.observe(30, 36, censored=True)
+    assert model.bias < 30 / 36 - 1
+    assert model.tewma_estimate(30) > 36
+    assert model.knn_estimate(30) > 36
+
+
+def test_uncensored_path_is_unchanged():
+    a, b = ClassModel(), ClassModel()
+    rng = random.Random(3)
+    for _ in range(50):
+        actual = rng.uniform(1, 50)
+        pred = max(1.0, actual * (1 + rng.gauss(0, 0.3)))
+        a.observe(pred, actual)
+        b.observe(pred, actual, censored=False)
+    assert (a.bias, a.variance, a.alpha, list(a.history)) == (b.bias, b.variance, b.alpha, list(b.history))
