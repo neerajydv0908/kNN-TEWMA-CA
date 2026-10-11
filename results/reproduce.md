@@ -1,6 +1,6 @@
 # Round 2 presentation, reproduced
 
-Reservations planned from true finish times, one seed per experiment (E1 and E2: 42, E3: 99, E4: 7). These are the numbers in the slides and the write-up, produced by `knn-tewma-ca reproduce`.
+Round 2 methodology (reservations planned from true finish times, schedulers told killed jobs' true runtimes, at most one queue-head start per event with no backfilling at that event, kNN stacked on the TEWMA bias correction) and one seed per experiment (E1 and E2: 42, E3: 99, E4: 7). These are the numbers in the slides and the write-up, produced by `knn-tewma-ca reproduce`.
 
 ## E1 · Baseline comparison (300 jobs, 8 nodes, p = 0.80)
 
