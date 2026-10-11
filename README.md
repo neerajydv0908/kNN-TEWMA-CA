@@ -18,7 +18,7 @@ This repo is a cleaned-up rebuild of the code behind my Round 2 presentation. It
 
 Relative changes in the right-hand column are averaged per seed, so they don't always equal the ratio of the two means.
 
-The short version: the reliability gain holds up across seeds, and under heavy contention it comes with no extra queue time compared with TEWMA. The utilization gain does not hold up; seed 42 was a lucky draw. And on the normal workload the extra safety costs more queue time than the single-seed run suggested. There's also an open issue in what the predictors learn from that affects the success numbers; see [What's still on my list](#whats-still-on-my-list).
+The short version: the reliability gain holds up across seeds, and under heavy contention it comes with no measurable extra queue time compared with TEWMA. The utilization gain does not hold up; seed 42 was a lucky draw. And on the normal workload the extra safety costs more queue time than the single-seed run suggested. There's also an open issue in what the predictors learn from that affects the success numbers; see [What's still on my list](#whats-still-on-my-list).
 
 ![E1 success rate and utilization across 30 seeds](results/figures/e1_efficiency.png)
 
@@ -48,17 +48,17 @@ Each class keeps an exponentially weighted bias $b$ and variance $v$ of $e$. The
 
 The runtime the scheduler allocates at confidence level $c$ removes the bias and adds a safety margin of $z_c$ standard deviations:
 
-$$r_{\text{TEWMA}} = \max\!\Big(0.9\,\hat p,\ \ \frac{\hat p}{1 + b}\cdot \max\big(0.5,\ 1 + z_c\sqrt{v}\big)\Big)$$
+$$r_{\text{TEWMA}} = \max\!\Big(0.9\,\hat p,\ \ \frac{\hat p}{\max(0.1,\ 1 + b)}\cdot \max\big(0.5,\ 1 + z_c\sqrt{v}\big)\Big)$$
 
-Until a class has seen three jobs it falls back to $1.25\,\hat p$. Each class also gets a **trust score** $\max(0,\ 1 - |b| - 0.5\sqrt{v})$.
+Each class also gets a **trust score** $\max(0,\ 1 - |b| - 0.5\sqrt{v})$. Until a class has seen three jobs, it allocates $1.25\,\hat p$ and its trust is a neutral 0.5. $\alpha$ starts at 0.3 and only adapts once four errors are in.
 
 ### 2. kNN refinement
 
-TEWMA corrects a whole class at once. The kNN step looks at the jobs most similar to this one: from the class's last 100 finished jobs it takes the $k = 8$ with the closest predictions in log space, $d = |\log(\hat p / \hat p_i)|$, so a 2-to-20 gap counts the same as 20-to-200. It averages their actual/predicted ratios $\rho_i$ with weights $1/(d + 0.001)$ and scales the TEWMA estimate:
+TEWMA corrects a whole class at once. The kNN step looks at the jobs most similar to this one: from the class's last 100 finished jobs it takes the $k = 8$ with the closest predictions in log space, $d = |\log(\hat p / \hat p_i)|$, so a 2-to-20 gap counts the same as 20-to-200. It averages their actual/predicted ratios $\rho_i$ with weights $1/(d + 0.001)$ (100 for an exact match) and scales the TEWMA estimate:
 
 $$r_{\text{kNN}} = \text{clip}\big(r_{\text{TEWMA}} \cdot \bar\rho,\ \ 0.6\,\hat p,\ \ \min(\rho_{\max}, 5)\,\hat p\big)$$
 
-$\rho_{\max}$ is a per-class cap: the largest observed ratio plus 10% headroom, decaying 1% per job so a single outlier doesn't set it forever.
+$\rho_{\max}$ is a per-class cap. It starts at 3, jumps to any newly observed ratio plus 10% headroom, and otherwise decays 1% per job so a single outlier doesn't set it forever. Until a class has 8 jobs of history, the kNN step is skipped and the TEWMA estimate is used as is.
 
 ### 3. Contention awareness
 
@@ -130,11 +130,11 @@ kNN-TEWMA-CA's success rate stays between 0.80 and 0.84 across sizes, but the ba
 | Metric | Baseline | TEWMA | kNN-TEWMA-CA | CA − TEWMA [95% CI] |
 |:--|--:|--:|--:|--:|
 | Success rate | 0.162 ± 0.042 | 0.661 ± 0.032 | **0.865 ± 0.018** | +0.204 [+0.192, +0.216] |
-| Utilization | 0.673 ± 0.040 | 0.671 ± 0.039 | 0.669 ± 0.035 | −0.002 [−0.012, +0.008] |
+| Utilization | **0.673 ± 0.040** | 0.671 ± 0.039 | 0.669 ± 0.035 | −0.002 [−0.012, +0.008] |
 | Avg wait | **449.6 ± 108.5** | 550.7 ± 117.1 | 548.2 ± 125.9 | −2.5 [−20.3, +15.3] |
 | Avg slowdown | **68.78 ± 16.74** | 87.57 ± 19.45 | 76.78 ± 20.66 | −10.79 [−15.90, −5.68] |
 
-This is where kNN-TEWMA-CA looks best. It completes 20 percentage points more jobs than TEWMA (better on all 30 seeds) at the same utilization and the same average wait, with lower slowdown. The +7.9% wait penalty in my slides turns out to be specific to that one seed. The baseline collapses to 16% success because it mostly allocates exactly what the under-predicting users asked for.
+This is where kNN-TEWMA-CA looks best. It completes 20 percentage points more jobs than TEWMA (better on all 30 seeds), with lower slowdown and no significant difference in utilization or average wait. The +7.9% wait penalty in my slides doesn't hold up: about half of it came from the old reservation planning (+4.0% on the same seed with fix 1 below), and across 30 seeds the difference is −2.5 time units with a CI that spans zero. The baseline still has the shortest queue, about 99 time units less waiting than kNN-TEWMA-CA, but it collapses to 16% success because it mostly allocates exactly what the under-predicting users asked for.
 
 ## What changed since Round 2
 
@@ -144,13 +144,13 @@ The rebuild fixes three methodology problems in the presentation code. The corre
 
 **2. Zero reservation violations is a guarantee, not a measured result.** In the slides "0 reservation violations" was a headline result for kNN-TEWMA-CA. It can't come out any other way. Every backfilled job gets an allocation that ends by the head job's reservation, and it's killed if it runs past that allocation, so it always hands its nodes back in time. Backfilling therefore can't push a reservation later, under any of the three schedulers. The simulator re-checks this after every backfill round and raises `ReservationGuaranteeError` if it ever fails. The tests check that no reserved job ever starts after the time it was promised, and that a deliberately broken scheduler that ignores the window is caught (`tests/test_reservation_guarantee.py`).
 
-**3. Thirty seeds instead of one.** Every number in the presentation came from a single random workload (seed 42 for E1/E2, 99 for E3, 7 for E4). Each experiment now runs on 30 workloads (seeds 0–29), with all schedulers on the same workloads. The tables report mean ± standard deviation, the comparisons are paired by seed with 95% confidence intervals, and I count how many seeds each scheduler wins. This is what showed that the utilization gain was a property of seed 42.
+**3. Thirty seeds instead of one.** Every number in the presentation came from a single random workload (seed 42 for E1/E2, 99 for E3, 7 for E4). Each experiment now runs on 30 workloads (seeds 0–29), with all schedulers on the same workloads. The tables report mean ± standard deviation, the comparisons are paired by seed with 95% confidence intervals, and I count on how many seeds kNN-TEWMA-CA beats each of the other two. This is what showed that the utilization gain was a property of seed 42.
 
 The full side-by-side comparison, including the "same seed, allocated-end reservations" column that isolates fix 1, is in [`results/comparison.md`](results/comparison.md).
 
 ## What's still on my list
 
-* **The predictors learn from killed jobs' true runtimes.** When a job is killed at its allocation, the simulator still feeds its real runtime to the TEWMA and kNN models. A real scheduler only learns that the job needed *more* than it was given, so those should be treated as censored observations. The success-rate results depend heavily on this, so it's the next thing I'm fixing.
+* **The schedulers learn from killed jobs' true runtimes.** When a job is killed at its allocation, the simulator still feeds its real runtime to the TEWMA and kNN models (and to the baseline's error average). A real scheduler only learns that the job needed *more* than it was given, so those should be treated as censored observations. The success-rate results depend heavily on this, so it's the next thing I'm fixing.
 * **One queue-head start per event.** The event loop starts at most one job from the head of the queue per event. When several jobs could start at the same moment, the rest wait for the next arrival or completion. This inflates waits and lowers utilization for all three schedulers.
 * **kNN-TEWMA-CA allocates generously.** The kNN ratio is applied on top of a TEWMA estimate that has already removed the class bias, so systematic under-prediction gets corrected twice until the class cap kicks in. Part of the success gain is simply larger allocations, and a baseline that pads every allocation by a fixed factor would be a fairer comparison.
 * **Scope:** synthetic workloads instead of real traces, a small 8-node cluster, nodes as the only resource, no per-user fairness, and several hand-picked parameters.

@@ -3,7 +3,7 @@
 ``ClassModel`` keeps one runtime model per runtime class (short / medium /
 long). It combines two estimators:
 
-* **TEWMA** (trust-weighted EWMA): an exponentially weighted estimate of the
+* **TEWMA** (trust-based EWMA): an exponentially weighted estimate of the
   relative prediction bias and its variance, turned into a confidence
   quantile of the runtime.
 * **kNN refinement**: an inverse-distance weighted average of the
